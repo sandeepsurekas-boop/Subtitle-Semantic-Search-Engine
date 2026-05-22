@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+.DS_Store
+.idea/
+.vscode/
+
+# Data & artifacts (large)
+data/*.db
+data/*.sqlite
+chroma_db/
+artifacts/
+*.pkl
+*.joblib
+queries/audio/*
+!queries/audio/.gitkeep
+
+# Models cache
+.cache/
+models/
