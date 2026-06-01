@@ -9,10 +9,26 @@ import chromadb
 
 import config
 from src.audio_query import transcribe_audio
-from src.chroma_store import extract_subtitle_id, get_client, get_filename, query_semantic
+from src.chroma_store import (
+    INGEST_INSTRUCTIONS,
+    extract_subtitle_id,
+    get_client,
+    get_filename,
+    get_index_status,
+    query_semantic,
+    semantic_collection_exists,
+)
 from src.cleaning import clean_query
 from src.embeddings import encode_query
 from src.keyword_search import KeywordSearchEngine
+
+
+class IndexNotReadyError(RuntimeError):
+    """Raised when ChromaDB or TF-IDF index has not been built via ingest."""
+
+    def __init__(self, message: str, status: dict | None = None):
+        super().__init__(message)
+        self.status = status or {}
 
 
 @dataclass
@@ -41,14 +57,31 @@ class SubtitleSearchEngine:
         chroma_path: Path = config.CHROMA_PATH,
         model_name: str = config.EMBEDDING_MODEL,
         artifacts_dir: Path = config.ARTIFACTS_DIR,
+        require_semantic: bool = True,
+        require_keyword: bool = False,
     ):
         self.model_name = model_name
+        self.chroma_path = chroma_path
+        self.artifacts_dir = artifacts_dir
+        self.status = get_index_status(chroma_path, artifacts_dir)
+
         self.client = get_client(chroma_path)
-        self.chunks = self.client.get_collection(config.COLLECTION_SEMANTIC)
+        self.chunks = None
+        if semantic_collection_exists(self.client):
+            self.chunks = self.client.get_collection(config.COLLECTION_SEMANTIC)
+
+        if require_semantic and self.chunks is None:
+            raise IndexNotReadyError(
+                f"Semantic index missing (collection '{config.COLLECTION_SEMANTIC}').\n"
+                f"{INGEST_INSTRUCTIONS}",
+                status=self.status,
+            )
+
         try:
             self.filenames = self.client.get_collection(config.COLLECTION_FILENAMES)
         except Exception:
             self.filenames = None
+
         self.keyword: KeywordSearchEngine | None = None
         v_path = artifacts_dir / "tfidf_vectorizer.joblib"
         if v_path.exists():
@@ -59,7 +92,26 @@ class SubtitleSearchEngine:
                 artifacts_dir / "tfidf_metadata.parquet",
             )
 
+        if require_keyword and self.keyword is None:
+            raise IndexNotReadyError(
+                "Keyword (TF-IDF) index missing. Run: python -m src.ingest --mode keyword",
+                status=self.status,
+            )
+
+    @classmethod
+    def create_if_ready(cls, mode: str = "semantic", **kwargs) -> "SubtitleSearchEngine":
+        return cls(
+            require_semantic=mode == "semantic",
+            require_keyword=mode == "keyword",
+            **kwargs,
+        )
+
     def search_semantic(self, query: str, top_k: int = 10) -> list[SearchResult]:
+        if self.chunks is None:
+            raise IndexNotReadyError(
+                f"Semantic index not built.\n{INGEST_INSTRUCTIONS}",
+                status=self.status,
+            )
         q = clean_query(query)
         emb = encode_query(q, self.model_name)
         raw = query_semantic(self.chunks, emb, n_results=top_k * 3)
@@ -69,10 +121,13 @@ class SubtitleSearchEngine:
         docs = (raw.get("documents") or [[]])[0]
         dists = (raw.get("distances") or [[]])[0]
 
-        for cid, doc, dist in zip(ids, docs, dists):
+        metas = (raw.get("metadatas") or [[]])[0]
+        for i, (cid, doc, dist) in enumerate(zip(ids, docs, dists)):
             sid = extract_subtitle_id(cid)
             fname = ""
-            if self.filenames:
+            if metas and i < len(metas) and metas[i]:
+                fname = metas[i].get("filename") or ""
+            if not fname and self.filenames:
                 fname = get_filename(self.filenames, sid) or ""
             # Chroma cosine distance: lower is better → similarity ≈ 1 - dist
             score = 1.0 - float(dist) if dist is not None else 0.0
@@ -138,7 +193,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=config.DEFAULT_TOP_K)
     args = parser.parse_args()
 
-    engine = SubtitleSearchEngine()
+    engine = SubtitleSearchEngine.create_if_ready(mode=args.mode)
 
     if args.audio:
         transcript, results = engine.search_audio(args.audio, mode=args.mode, top_k=args.top_k)

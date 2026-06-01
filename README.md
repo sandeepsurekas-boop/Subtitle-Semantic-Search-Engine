@@ -4,15 +4,17 @@ Enhance search relevance for **video subtitles** using NLP and vector retrieval.
 
 ## What this demonstrates
 
-| Concept | Implementation |
-|--------|----------------|
-| Document ingest | SQLite `zipfiles` → ZIP decode → clean |
-| Chunking | Overlapping **500-token** windows (tiktoken) |
-| Keyword search | TF-IDF + cosine similarity |
-| Semantic search | `paraphrase-MiniLM-L6-v2` embeddings |
-| Vector DB | **ChromaDB** (cosine HNSW) |
-| Audio → text | **OpenAI Whisper** |
-| API | **FastAPI** + **Streamlit** UI |
+
+| Concept         | Implementation                               |
+| --------------- | -------------------------------------------- |
+| Document ingest | SQLite `zipfiles` → ZIP decode → clean       |
+| Chunking        | Overlapping **500-token** windows (tiktoken) |
+| Keyword search  | TF-IDF + cosine similarity                   |
+| Semantic search | `paraphrase-MiniLM-L6-v2` embeddings         |
+| Vector DB       | **ChromaDB** (cosine HNSW)                   |
+| Audio → text    | **OpenAI Whisper**                           |
+| API             | **FastAPI** + **Streamlit** UI               |
+
 
 ## Project layout
 
@@ -21,7 +23,7 @@ subtitle-semantic-search/
 ├── config.py              # Paths & hyperparameters
 ├── data/
 │   ├── README.txt         # Database schema
-│   └── eng_subtitles_database.db   # YOU download this
+│   └── eng_subtitles_database.db   
 ├── src/
 │   ├── database.py        # Part 1: read & decode DB
 │   ├── cleaning.py        # Remove timestamps, ads, noise
@@ -51,25 +53,28 @@ pip install -r requirements.txt
 
 ### 2. Download data
 
-Place **`eng_subtitles_database.db`** in `data/` (see `data/README.txt`).
+Place `**eng_subtitles_database.db**` in `data/` (see `data/README.txt`).
 
 ```bash
 python scripts/download_data.py
 python scripts/download_data.py --check
 ```
 
-**Limited compute?** Sample 30% during ingest:
+**Limited compute?** Start with 5% sample:
 
 ```bash
-python -m src.ingest --sample 0.3
+python -m src.ingest --mode semantic --sample 0.05 --reset
 ```
+
+Install **ffmpeg** for audio search: `brew install ffmpeg`
 
 ### 3. Ingest (Part 1)
 
-Build **both** indexes (semantic + keyword):
+Build indexes (batched — stable on large DB):
 
 ```bash
-python -m src.ingest --mode both
+python -m src.ingest --mode semantic --sample 0.05 --reset
+python -m src.ingest --mode both --sample 0.1
 ```
 
 Or separately:
@@ -109,13 +114,15 @@ uvicorn app.main:app --reload --port 8000
 streamlit run streamlit_app.py
 ```
 
+**Live audio search:** open Streamlit → **Audio search** → use **Record live audio** (~2 min clip) → **Search audio**.
+
 ## Core algorithm
 
 1. **Preprocess** — decode ZIP subtitles, remove SRT timestamps and OpenSubtitles boilerplate.
 2. **Chunk** — split long subtitles into 500-token windows with 50-token overlap.
 3. **Vectorize**
-   - Keyword: TF-IDF sparse vectors
-   - Semantic: SentenceTransformer dense embeddings (L2-normalized)
+  - Keyword: TF-IDF sparse vectors
+  - Semantic: SentenceTransformer dense embeddings (L2-normalized)
 4. **Store** — ChromaDB (`cosine` space) for semantic chunks; joblib/npz for TF-IDF.
 5. **Query** — embed (or TF-IDF transform) the query; rank by **cosine similarity**.
 6. **Audio** — Whisper transcript → same pipeline as text.
@@ -124,13 +131,15 @@ streamlit run streamlit_app.py
 
 Edit `config.py` or `.env` (from `.env.example`):
 
-| Setting | Default |
-|---------|---------|
-| `SAMPLE_FRACTION` | `1.0` (use `0.3` on low RAM) |
-| `CHUNK_SIZE_TOKENS` | `500` |
-| `CHUNK_OVERLAP_TOKENS` | `50` |
-| `EMBEDDING_MODEL` | `paraphrase-MiniLM-L6-v2` |
-| `WHISPER_MODEL` | `base` |
+
+| Setting                | Default                      |
+| ---------------------- | ---------------------------- |
+| `SAMPLE_FRACTION`      | `1.0` (use `0.3` on low RAM) |
+| `CHUNK_SIZE_TOKENS`    | `500`                        |
+| `CHUNK_OVERLAP_TOKENS` | `50`                         |
+| `EMBEDDING_MODEL`      | `paraphrase-MiniLM-L6-v2`    |
+| `WHISPER_MODEL`        | `base`                       |
+
 
 ## API examples
 

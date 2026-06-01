@@ -4,6 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from src.env_setup import configure_safe_runtime
+
+configure_safe_runtime()
+
 import chromadb
 from chromadb.config import Settings
 
@@ -90,11 +94,31 @@ def get_filename(collection, subtitle_id: str) -> str | None:
     try:
         res = collection.get(ids=[subtitle_id], include=["documents"])
         docs = res.get("documents") or []
-        if docs and docs[0]:
-            return docs[0]
+        if not docs:
+            return None
+        doc = docs[0]
+        if isinstance(doc, list):
+            doc = doc[0] if doc else None
+        return doc or None
     except Exception:
         pass
     return None
+
+
+def upsert_filename_map_batched(
+    collection,
+    subtitle_ids: list[str],
+    filenames: list[str],
+    batch_size: int = 500,
+    embedding_dim: int = 8,
+) -> None:
+    for i in range(0, len(subtitle_ids), batch_size):
+        upsert_filename_map(
+            collection,
+            subtitle_ids[i : i + batch_size],
+            filenames[i : i + batch_size],
+            embedding_dim=embedding_dim,
+        )
 
 
 def extract_subtitle_id(chunk_id: str) -> str:
@@ -102,3 +126,45 @@ def extract_subtitle_id(chunk_id: str) -> str:
     if "-" in chunk_id:
         return chunk_id.rsplit("-", 1)[0]
     return chunk_id
+
+
+def semantic_collection_exists(client: chromadb.PersistentClient) -> bool:
+    try:
+        coll = client.get_collection(config.COLLECTION_SEMANTIC)
+        return coll.count() > 0
+    except Exception:
+        return False
+
+
+def get_index_status(
+    chroma_path: Path = config.CHROMA_PATH,
+    artifacts_dir: Path = config.ARTIFACTS_DIR,
+    db_path: Path = config.DB_PATH,
+) -> dict:
+    """Report what is ready so UIs can show setup instructions."""
+    status = {
+        "database": db_path.exists(),
+        "semantic_index": False,
+        "semantic_chunks": 0,
+        "keyword_index": (artifacts_dir / "tfidf_vectorizer.joblib").exists(),
+    }
+    if chroma_path.exists():
+        client = get_client(chroma_path)
+        try:
+            coll = client.get_collection(config.COLLECTION_SEMANTIC)
+            status["semantic_chunks"] = coll.count()
+            status["semantic_index"] = status["semantic_chunks"] > 0
+        except Exception:
+            pass
+    return status
+
+
+INGEST_INSTRUCTIONS = """
+Index not built yet. Run ingest first (from project root, venv active):
+
+  python scripts/download_data.py --check
+  python -m src.ingest --mode both --sample 0.1    # quick test
+  python -m src.ingest --mode both                 # full index
+
+Then restart Streamlit.
+""".strip()

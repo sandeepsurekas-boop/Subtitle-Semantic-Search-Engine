@@ -19,8 +19,8 @@ TFIDF_META_PATH = ARTIFACTS_DIR / "tfidf_metadata.parquet"
 COLLECTION_SEMANTIC = "subtitle_chunks"
 COLLECTION_FILENAMES = "subtitle_filenames"
 
-# Embedding model (semantic search)
-EMBEDDING_MODEL = "paraphrase-MiniLM-L6-v2"
+# Embedding model (semantic search) — L3 is lighter on Mac RAM
+EMBEDDING_MODEL = "paraphrase-MiniLM-L3-v2"
 
 # Chunking (token windows with overlap — assignment requirement)
 CHUNK_SIZE_TOKENS = 500

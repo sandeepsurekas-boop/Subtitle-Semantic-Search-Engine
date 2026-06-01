@@ -19,13 +19,90 @@ def _to_bytes(raw) -> bytes:
 
 
 def decompress_subtitle(raw) -> str:
-    """Extract first file from ZIP blob and decode as latin-1."""
-    data = _to_bytes(raw)
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = zf.namelist()
-        if not names:
-            return ""
-        return zf.read(names[0]).decode("latin-1", errors="replace")
+    """
+    Extract first file from ZIP blob and decode as latin-1.
+
+    Matches course notebook `decode_method` in project_hint_reading_the_data.ipynb.
+    """
+    try:
+        data = _to_bytes(raw)
+        with io.BytesIO(data) as f:
+            with zipfile.ZipFile(f, "r") as zip_file:
+                names = zip_file.namelist()
+                if not names:
+                    return ""
+                subtitle_content = zip_file.read(names[0])
+        return subtitle_content.decode("latin-1", errors="replace")
+    except Exception:
+        return ""
+
+
+def _decode_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["content"] = out["content"].map(decompress_subtitle)
+    out["num"] = out["num"].astype(str)
+    return out
+
+
+def iter_subtitle_batches(
+    db_path: Path,
+    batch_size: int = 50,
+    sample_fraction: float = 1.0,
+    random_seed: int = 42,
+) -> Iterator[pd.DataFrame]:
+    """
+    Yield subtitle batches; decode ZIP per batch to limit RAM use.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"Database not found: {db_path}\n"
+            "Place eng_subtitles_database.db in data/ — see data/README.txt"
+        )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        if 0 < sample_fraction < 1.0:
+            total = conn.execute("SELECT COUNT(*) FROM zipfiles").fetchone()[0]
+            limit = max(1, int(total * sample_fraction))
+            # Fixed sample: pick IDs once, then fetch/decode in batches
+            id_df = pd.read_sql_query(
+                f"""
+                SELECT num FROM zipfiles
+                ORDER BY RANDOM()
+                LIMIT {limit}
+                """,
+                conn,
+            )
+            nums = id_df["num"].tolist()
+            for start in range(0, len(nums), batch_size):
+                batch_nums = nums[start : start + batch_size]
+                placeholders = ",".join("?" * len(batch_nums))
+                chunk = pd.read_sql_query(
+                    f"SELECT num, name, content FROM zipfiles WHERE num IN ({placeholders})",
+                    conn,
+                    params=batch_nums,
+                )
+                if not chunk.empty:
+                    yield _decode_frame(chunk)
+            return
+
+        offset = 0
+        while True:
+            chunk = pd.read_sql_query(
+                """
+                SELECT num, name, content FROM zipfiles
+                ORDER BY num
+                LIMIT ? OFFSET ?
+                """,
+                conn,
+                params=(batch_size, offset),
+            )
+            if chunk.empty:
+                break
+            yield _decode_frame(chunk)
+            offset += batch_size
+    finally:
+        conn.close()
 
 
 def load_subtitles(
@@ -33,40 +110,15 @@ def load_subtitles(
     sample_fraction: float = 1.0,
     random_seed: int = 42,
 ) -> pd.DataFrame:
-    """
-    Load zipfiles table; optionally sample rows for limited compute.
-
-    Returns DataFrame with columns: num, name, content (decoded text).
-    """
-    if not db_path.exists():
-        raise FileNotFoundError(
-            f"Database not found: {db_path}\n"
-            "Download eng_subtitles_database.db into data/ — see data/README.txt"
+    """Load subtitles into one DataFrame — only for small samples."""
+    parts = list(
+        iter_subtitle_batches(
+            db_path,
+            batch_size=100,
+            sample_fraction=sample_fraction,
+            random_seed=random_seed,
         )
-
-    conn = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query("SELECT num, name, content FROM zipfiles", conn)
-    finally:
-        conn.close()
-
-    if 0 < sample_fraction < 1.0:
-        df = df.sample(frac=sample_fraction, random_state=random_seed).reset_index(
-            drop=True
-        )
-
-    df["content"] = df["content"].map(decompress_subtitle)
-    df["num"] = df["num"].astype(str)
-    return df
-
-
-def iter_subtitles(
-    db_path: Path,
-    batch_size: int = 500,
-    sample_fraction: float = 1.0,
-    random_seed: int = 42,
-) -> Iterator[pd.DataFrame]:
-    """Yield decoded subtitle batches without loading full DB into memory at once."""
-    df = load_subtitles(db_path, sample_fraction, random_seed)
-    for start in range(0, len(df), batch_size):
-        yield df.iloc[start : start + batch_size].copy()
+    )
+    if not parts:
+        return pd.DataFrame(columns=["num", "name", "content"])
+    return pd.concat(parts, ignore_index=True)

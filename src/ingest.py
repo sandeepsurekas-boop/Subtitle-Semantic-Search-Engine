@@ -2,23 +2,31 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
 
-import config
-from src.chunker import TextChunk, chunk_corpus
-from src.cleaning import clean_subtitle_text
-from src.database import load_subtitles
-from src.embeddings import encode_texts
-from src.chroma_store import (
+# Must run before heavy native libs load
+from src.env_setup import configure_safe_runtime
+
+configure_safe_runtime()
+
+import config  # noqa: E402
+from src.chunker import chunk_corpus  # noqa: E402
+from src.cleaning import clean_subtitle_text  # noqa: E402
+from src.database import iter_subtitle_batches  # noqa: E402
+from src.embeddings import encode_texts  # noqa: E402
+from src.chroma_store import (  # noqa: E402
     add_chunks_batch,
     get_client,
     get_or_create_collections,
-    upsert_filename_map,
+    upsert_filename_map_batched,
 )
-from src.keyword_search import KeywordSearchEngine
+from src.keyword_search import KeywordSearchEngine  # noqa: E402
 
 
 def prepare_records(df: pd.DataFrame) -> list[tuple[str, str, str]]:
@@ -30,127 +38,185 @@ def prepare_records(df: pd.DataFrame) -> list[tuple[str, str, str]]:
     return records
 
 
-def ingest_semantic(
-    df: pd.DataFrame,
+def ingest_semantic_batches(
+    db_path: Path,
     chroma_path: Path,
     model_name: str,
     chunk_size: int,
     overlap: int,
-    batch_embed: int = 64,
+    sample_fraction: float,
+    batch_size: int,
+    batch_embed: int = 8,
+    device: str = "cpu",
+    chroma_write_batch: int = 100,
 ) -> int:
-    records = prepare_records(df)
-    chunks = chunk_corpus(records, chunk_size=chunk_size, overlap=overlap)
-    if not chunks:
-        print("No chunks produced.")
-        return 0
-
-    print(f"Encoding {len(chunks)} chunks with {model_name}...")
-    texts = [c.text for c in chunks]
-    embeddings = encode_texts(
-        texts, model_name, batch_size=batch_embed, show_progress=True
-    )
-
     client = get_client(chroma_path)
     coll_chunks, coll_names = get_or_create_collections(client)
 
-    metadatas = [
-        {
-            "subtitle_id": c.subtitle_id,
-            "chunk_index": c.chunk_index,
-            "filename": next(
-                (n for sid, n, _ in records if sid == c.subtitle_id), ""
-            ),
-        }
-        for c in chunks
-    ]
+    total_chunks = 0
+    filename_ids: list[str] = []
+    filename_names: list[str] = []
+    seen_ids: set[str] = set()
 
-    print("Writing to ChromaDB...")
-    add_chunks_batch(
-        coll_chunks,
-        chunks,
-        embeddings.tolist(),
-        metadatas=metadatas,
+    batch_iter = iter_subtitle_batches(
+        db_path, batch_size=batch_size, sample_fraction=sample_fraction
     )
 
-    unique = df.drop_duplicates("num")
-    upsert_filename_map(
-        coll_names,
-        unique["num"].astype(str).tolist(),
-        unique["name"].astype(str).tolist(),
-    )
-    return len(chunks)
+    for df in tqdm(batch_iter, desc="Ingest semantic"):
+        records = prepare_records(df)
+        del df
+        if not records:
+            continue
+
+        chunks = chunk_corpus(records, chunk_size=chunk_size, overlap=overlap)
+        if not chunks:
+            continue
+
+        texts = [c.text for c in chunks]
+        embeddings = encode_texts(
+            texts,
+            model_name,
+            batch_size=batch_embed,
+            show_progress=False,
+            device=device,
+        )
+
+        id_to_name = {sid: name for sid, name, _ in records}
+        metadatas = [
+            {
+                "subtitle_id": c.subtitle_id,
+                "chunk_index": c.chunk_index,
+                "filename": id_to_name.get(c.subtitle_id, ""),
+            }
+            for c in chunks
+        ]
+        add_chunks_batch(
+            coll_chunks,
+            chunks,
+            embeddings.tolist(),
+            metadatas=metadatas,
+            batch_size=chroma_write_batch,
+        )
+
+        for sid, name, _ in records:
+            if sid not in seen_ids:
+                seen_ids.add(sid)
+                filename_ids.append(sid)
+                filename_names.append(name)
+
+        total_chunks += len(chunks)
+        del chunks, texts, embeddings, records
+        gc.collect()
+
+    if filename_ids:
+        upsert_filename_map_batched(coll_names, filename_ids, filename_names)
+
+    return total_chunks
 
 
-def ingest_keyword(
-    df: pd.DataFrame,
+def ingest_keyword_batches(
+    db_path: Path,
     artifacts_dir: Path,
     chunk_size: int,
     overlap: int,
+    sample_fraction: float,
+    batch_size: int,
 ) -> int:
-    records = prepare_records(df)
-    chunks = chunk_corpus(records, chunk_size=chunk_size, overlap=overlap)
-    if not chunks:
+    all_chunk_ids: list[str] = []
+    all_texts: list[str] = []
+    meta_rows: list[dict] = []
+
+    for df in tqdm(
+        iter_subtitle_batches(db_path, batch_size=batch_size, sample_fraction=sample_fraction),
+        desc="Ingest keyword",
+    ):
+        records = prepare_records(df)
+        chunks = chunk_corpus(records, chunk_size=chunk_size, overlap=overlap)
+        id_to_name = {sid: name for sid, name, _ in records}
+        for c in chunks:
+            all_chunk_ids.append(c.chunk_id)
+            all_texts.append(c.text)
+            meta_rows.append(
+                {
+                    "chunk_id": c.chunk_id,
+                    "subtitle_id": c.subtitle_id,
+                    "filename": id_to_name.get(c.subtitle_id, ""),
+                    "text": c.text,
+                }
+            )
+        del df, records, chunks
+        gc.collect()
+
+    if not all_texts:
         return 0
 
-    id_to_name = {sid: name for sid, name, _ in records}
-    meta = pd.DataFrame(
-        {
-            "chunk_id": [c.chunk_id for c in chunks],
-            "subtitle_id": [c.subtitle_id for c in chunks],
-            "filename": [id_to_name.get(c.subtitle_id, "") for c in chunks],
-            "text": [c.text for c in chunks],
-        }
-    )
-
-    print(f"Fitting TF-IDF on {len(chunks)} chunks...")
+    meta = pd.DataFrame(meta_rows)
+    print(f"Fitting TF-IDF on {len(all_texts)} chunks...")
     engine = KeywordSearchEngine()
-    engine.fit(
-        meta["chunk_id"].tolist(),
-        meta["text"].tolist(),
-        meta,
-    )
+    engine.fit(all_chunk_ids, all_texts, meta)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     engine.save(
         artifacts_dir / "tfidf_vectorizer.joblib",
         artifacts_dir / "tfidf_matrix.npz",
         artifacts_dir / "tfidf_metadata.parquet",
     )
-    return len(chunks)
+    return len(all_texts)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest subtitle database")
-    parser.add_argument(
-        "--mode",
-        choices=["semantic", "keyword", "both"],
-        default="both",
-        help="semantic=Chroma+SentenceTransformers, keyword=TF-IDF",
-    )
+    parser.add_argument("--mode", choices=["semantic", "keyword", "both"], default="both")
     parser.add_argument("--db", type=Path, default=config.DB_PATH)
     parser.add_argument("--sample", type=float, default=config.SAMPLE_FRACTION)
-    parser.add_argument("--seed", type=int, default=config.RANDOM_SEED)
+    parser.add_argument("--batch-size", type=int, default=50, help="Subtitles per DB batch")
+    parser.add_argument("--embed-batch", type=int, default=8, help="Embedding mini-batch size")
+    parser.add_argument("--device", default="cpu", choices=["cpu"], help="Use cpu on Mac")
     parser.add_argument("--chroma-path", type=Path, default=config.CHROMA_PATH)
     parser.add_argument("--artifacts", type=Path, default=config.ARTIFACTS_DIR)
     parser.add_argument("--model", default=config.EMBEDDING_MODEL)
     parser.add_argument("--chunk-size", type=int, default=config.CHUNK_SIZE_TOKENS)
     parser.add_argument("--overlap", type=int, default=config.CHUNK_OVERLAP_TOKENS)
+    parser.add_argument("--reset", action="store_true")
     args = parser.parse_args()
 
-    print(f"Loading subtitles from {args.db} (sample={args.sample})...")
-    df = load_subtitles(args.db, sample_fraction=args.sample, random_seed=args.seed)
-    print(f"Loaded {len(df)} subtitle files.")
+    if sys.platform == "darwin":
+        print("macOS: using CPU-only, single-threaded mode (avoids bus errors).")
+
+    if args.reset:
+        if args.chroma_path.exists():
+            shutil.rmtree(args.chroma_path)
+        if args.artifacts.exists():
+            shutil.rmtree(args.artifacts)
+        print("Cleared chroma_db/ and artifacts/")
+
+    print(
+        f"Ingest from {args.db} (sample={args.sample}, "
+        f"batch_size={args.batch_size}, embed_batch={args.embed_batch})"
+    )
 
     if args.mode in ("semantic", "both"):
-        n = ingest_semantic(
-            df,
+        n = ingest_semantic_batches(
+            args.db,
             args.chroma_path,
             args.model,
             args.chunk_size,
             args.overlap,
+            args.sample,
+            args.batch_size,
+            batch_embed=args.embed_batch,
+            device=args.device,
         )
-        print(f"Semantic ingest complete: {n} chunks indexed.")
+        print(f"Semantic ingest complete: {n} chunks in ChromaDB.")
 
     if args.mode in ("keyword", "both"):
-        n = ingest_keyword(df, args.artifacts, args.chunk_size, args.overlap)
+        n = ingest_keyword_batches(
+            args.db,
+            args.artifacts,
+            args.chunk_size,
+            args.overlap,
+            args.sample,
+            args.batch_size,
+        )
         print(f"Keyword ingest complete: {n} chunks in TF-IDF index.")
 
 

@@ -4,36 +4,41 @@ from __future__ import annotations
 from functools import lru_cache
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+
+from src.env_setup import configure_safe_runtime, configure_torch_threads
+
+configure_safe_runtime()
 
 
 @lru_cache(maxsize=1)
-def get_embedding_model(model_name: str, device: str | None = None) -> SentenceTransformer:
-    if device is None:
-        import torch
+def get_embedding_model(model_name: str, device: str = "cpu"):
+    from sentence_transformers import SentenceTransformer
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    configure_torch_threads()
     return SentenceTransformer(model_name, device=device)
 
 
 def encode_texts(
     texts: list[str],
     model_name: str,
-    batch_size: int = 64,
+    batch_size: int = 8,
     show_progress: bool = False,
-    device: str | None = None,
+    device: str = "cpu",
 ) -> np.ndarray:
+    if not texts:
+        return np.array([])
+
     model = get_embedding_model(model_name, device=device)
     return model.encode(
         texts,
-        batch_size=batch_size,
+        batch_size=min(batch_size, len(texts)),
         show_progress_bar=show_progress,
         convert_to_numpy=True,
         normalize_embeddings=True,
     )
 
 
-def encode_query(query: str, model_name: str, device: str | None = None) -> list[float]:
+def encode_query(query: str, model_name: str, device: str = "cpu") -> list[float]:
     vec = encode_texts([query], model_name, device=device)[0]
     return vec.tolist()
 

@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import config
-from src.retrieve import SearchResult, SubtitleSearchEngine
+from src.chroma_store import get_index_status
+from src.retrieve import IndexNotReadyError, SearchResult, SubtitleSearchEngine
 
 app = FastAPI(
     title="Subtitle Semantic Search",
@@ -24,10 +25,10 @@ app.add_middleware(
 _engine: SubtitleSearchEngine | None = None
 
 
-def get_engine() -> SubtitleSearchEngine:
+def get_engine(mode: str = "semantic") -> SubtitleSearchEngine:
     global _engine
     if _engine is None:
-        _engine = SubtitleSearchEngine()
+        _engine = SubtitleSearchEngine.create_if_ready(mode=mode)
     return _engine
 
 
@@ -64,22 +65,20 @@ def _to_response(results: list[SearchResult]) -> list[HitResponse]:
 
 @app.get("/health")
 def health():
-    engine = get_engine()
-    return {
-        "status": "ok",
-        "semantic_index": engine.chunks.count() if engine.chunks else 0,
-        "keyword_index": engine.keyword is not None,
-    }
+    status = get_index_status()
+    return {"status": "ok", **status}
 
 
 @app.post("/search/text", response_model=TextSearchResponse)
 def search_text(body: TextSearchRequest):
-    engine = get_engine()
     try:
+        engine = get_engine(body.mode)
         if body.mode == "keyword":
             results = engine.search_keyword(body.query, body.top_k)
         else:
             results = engine.search_semantic(body.query, body.top_k)
+    except IndexNotReadyError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return TextSearchResponse(results=_to_response(results))
@@ -97,9 +96,11 @@ async def search_audio(
     content = await file.read()
     dest.write_bytes(content)
 
-    engine = get_engine()
     try:
+        engine = get_engine("semantic")
         _transcript, results = engine.search_audio(dest, mode=mode, top_k=top_k)
+    except IndexNotReadyError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return TextSearchResponse(results=_to_response(results))
