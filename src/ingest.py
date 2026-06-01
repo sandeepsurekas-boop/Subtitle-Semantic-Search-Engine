@@ -16,6 +16,9 @@ from src.env_setup import configure_safe_runtime
 configure_safe_runtime()
 
 import config  # noqa: E402
+from src.logging_config import get_logger, setup_logging  # noqa: E402
+
+logger = get_logger("ingest")
 from src.chunker import chunk_corpus  # noqa: E402
 from src.cleaning import clean_subtitle_text  # noqa: E402
 from src.database import iter_subtitle_batches  # noqa: E402
@@ -30,11 +33,12 @@ from src.keyword_search import KeywordSearchEngine  # noqa: E402
 
 
 def prepare_records(df: pd.DataFrame) -> list[tuple[str, str, str]]:
+    """Return (id, filename, raw_subtitle_text) — chunker extracts dialogue cues."""
     records = []
     for _, row in df.iterrows():
-        cleaned = clean_subtitle_text(row["content"])
-        if cleaned:
-            records.append((str(row["num"]), str(row["name"]), cleaned))
+        raw = row["content"]
+        if clean_subtitle_text(raw):
+            records.append((str(row["num"]), str(row["name"]), raw))
     return records
 
 
@@ -105,6 +109,7 @@ def ingest_semantic_batches(
                 filename_names.append(name)
 
         total_chunks += len(chunks)
+        logger.info("Batch done: +%d chunks (running total=%d)", len(chunks), total_chunks)
         del chunks, texts, embeddings, records
         gc.collect()
 
@@ -177,7 +182,10 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=config.CHUNK_SIZE_TOKENS)
     parser.add_argument("--overlap", type=int, default=config.CHUNK_OVERLAP_TOKENS)
     parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--debug", action="store_true", help="DEBUG logging")
     args = parser.parse_args()
+
+    setup_logging("DEBUG" if args.debug else config.LOG_LEVEL)
 
     if sys.platform == "darwin":
         print("macOS: using CPU-only, single-threaded mode (avoids bus errors).")

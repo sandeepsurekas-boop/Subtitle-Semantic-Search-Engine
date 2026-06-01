@@ -1,166 +1,287 @@
-# Subtitle Semantic Search Engine (Shazam for Subtitles)
+# Subtitle Semantic Search Engine
 
-Enhance search relevance for **video subtitles** using NLP and vector retrieval. Compare **keyword (TF-IDF)** vs **semantic (SentenceTransformers)** search, with **audio queries** transcribed via Whisper.
+A **Shazam-style** search tool for movie and TV subtitles. Type a quote you remember, or play/record a short audio clip — the system finds the closest matching subtitles from OpenSubtitles data using **vector search** and **cosine similarity**.
 
-## What this demonstrates
+Built for the LearnBay / Innomatics project: *Enhancing Search Engine Relevance for Video Subtitles*.
+
+---
+
+## About the project
+
+### Problem
+
+Users often remember **a line of dialogue**, not the movie title. Classic search matches titles and metadata, not what was actually **said** in the video.
+
+### Solution
 
 
-| Concept         | Implementation                               |
-| --------------- | -------------------------------------------- |
-| Document ingest | SQLite `zipfiles` → ZIP decode → clean       |
-| Chunking        | Overlapping **500-token** windows (tiktoken) |
-| Keyword search  | TF-IDF + cosine similarity                   |
-| Semantic search | `paraphrase-MiniLM-L6-v2` embeddings         |
-| Vector DB       | **ChromaDB** (cosine HNSW)                   |
-| Audio → text    | **OpenAI Whisper**                           |
-| API             | **FastAPI** + **Streamlit** UI               |
+| Stage      | What happens                                                                                                        |
+| ---------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Ingest** | Read `eng_subtitles_database.db` → unzip subtitles → clean text → split into chunks → embed → store in **ChromaDB** |
+| **Search** | Your query (text or audio→text) → same embedding model → **cosine similarity** vs all chunks → top matches          |
 
 
-## Project layout
+### Two search modes
+
+
+| Mode                   | How it works                                       | Best for                     |
+| ---------------------- | -------------------------------------------------- | ---------------------------- |
+| **Semantic** (default) | SentenceTransformer embeddings + cosine similarity | Similar meaning, paraphrases |
+| **Keyword**            | TF-IDF sparse vectors + cosine similarity          | Exact words in the subtitle  |
+
+
+### Tech stack
+
+- Python 3.11+
+- SQLite + ZIP subtitle archives (course database)
+- [SentenceTransformers](https://www.sbert.net/) (`paraphrase-MiniLM-L3-v2`)
+- [ChromaDB](https://www.trychroma.com/) (cosine HNSW)
+- [OpenAI Whisper](https://github.com/openai/whisper) (audio queries)
+- [Streamlit](https://streamlit.io/) (web UI)
+
+---
+
+## Project structure
 
 ```
 subtitle-semantic-search/
-├── config.py              # Paths & hyperparameters
 ├── data/
-│   ├── README.txt         # Database schema
-│   └── eng_subtitles_database.db   
+│   ├── README.txt                      # Database schema
+│   └── eng_subtitles_database.db       # YOU provide (~1.8 GB)
 ├── src/
-│   ├── database.py        # Part 1: read & decode DB
-│   ├── cleaning.py        # Remove timestamps, ads, noise
-│   ├── chunker.py         # Overlapping token chunks (required)
-│   ├── embeddings.py      # SentenceTransformers
-│   ├── chroma_store.py    # ChromaDB ingest/query
-│   ├── keyword_search.py  # TF-IDF index
-│   ├── ingest.py          # Full ingest pipeline
-│   ├── retrieve.py        # Text + audio search
-│   └── audio_query.py     # Whisper transcription
-├── app/main.py            # FastAPI
-├── streamlit_app.py       # Web UI
-├── scripts/download_data.py
+│   ├── database.py                     # Read & decode ZIP subtitles
+│   ├── cleaning.py                     # Remove timestamps, ads
+│   ├── chunker.py                      # 500-token windows, 50 overlap
+│   ├── embeddings.py                   # SentenceTransformers
+│   ├── chroma_store.py                 # Vector DB
+│   ├── keyword_search.py               # TF-IDF index
+│   ├── ingest.py                       # Part 1 — build index
+│   ├── retrieve.py                     # Part 2 — search + logging
+│   ├── audio_query.py                  # Whisper transcription
+│   └── logging_config.py               # Debug retrieval scores
+├── scripts/
+│   ├── download_data.py                # Check DB is present
+│   └── check_index.py                  # Check index is built
+├── streamlit_app.py                    # Main UI (text + voice)
+├── config.py                           # Paths & settings
+├── logs/retrieval.log                  # Created when you search (DEBUG detail)
 └── requirements.txt
 ```
 
-## Quick start
+---
 
-### 1. Environment
+## Prerequisites
+
+1. **Python 3.11+**
+2. **ffmpeg** (for audio search): `brew install ffmpeg`
+3. **Database file**: `data/eng_subtitles_database.db` (82,498 English subtitles from OpenSubtitles)
+
+---
+
+## Setup (from scratch)
 
 ```bash
 cd subtitle-semantic-search
-python -m venv .venv
+
+# 1. Virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-### 2. Download data
-
-Place `**eng_subtitles_database.db**` in `data/` (see `data/README.txt`).
-
-```bash
-python scripts/download_data.py
+# 2. Place database in data/
 python scripts/download_data.py --check
-```
+# Expected: OK: ... (82,498 rows in zipfiles)
 
-**Limited compute?** Start with 5% sample:
+# 3. Clear old indexes (fresh start)
+rm -rf chroma_db artifacts logs
 
-```bash
+# 4. Build search index (start small on Mac)
 python -m src.ingest --mode semantic --sample 0.05 --reset
+
+# 5. Verify
+python scripts/check_index.py
 ```
 
-Install **ffmpeg** for audio search: `brew install ffmpeg`
-
-### 3. Ingest (Part 1)
-
-Build indexes (batched — stable on large DB):
+### macOS ingest (if you see `bus error`)
 
 ```bash
-python -m src.ingest --mode semantic --sample 0.05 --reset
-python -m src.ingest --mode both --sample 0.1
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=1
+python -m src.ingest --mode semantic --sample 0.02 --reset --batch-size 25 --embed-batch 4
 ```
 
-Or separately:
+---
+
+## How to run
+
+### Web app (recommended)
 
 ```bash
-python -m src.ingest --mode semantic
-python -m src.ingest --mode keyword
+source .venv/bin/activate
+streamlit run streamlit_app.py
 ```
 
-### 4. Search (Part 2)
+- **Type a quote** — text search  
+- **Use your voice** — record → listen → convert to words → search
 
-**Text query** (semantic):
-
-```bash
-python -m src.retrieve --mode semantic --query "i am your father"
-```
-
-**Keyword search:**
+### Command line search
 
 ```bash
+# Semantic
+python -m src.retrieve --mode semantic --query "may the force be with you"
+
+# Keyword (needs keyword ingest)
 python -m src.retrieve --mode keyword --query "winter is coming"
+
+# Audio file
+python -m src.retrieve --mode semantic --audio path/to/clip.wav
 ```
 
-**Audio query** (~2 min TV/movie clip from the database):
+---
+
+## Logging & debugging retrieval
+
+To see **exact cosine distances**, cleaned queries, and per-chunk scores:
 
 ```bash
-python -m src.retrieve --mode semantic --audio queries/audio/your_clip.wav
+# Console + logs/retrieval.log
+export LOG_LEVEL=DEBUG
+python -m src.retrieve --mode semantic --query "i am your father" --debug
+
+# Or tail the log while using Streamlit
+export LOG_LEVEL=DEBUG
+streamlit run streamlit_app.py
+# In another terminal:
+tail -f logs/retrieval.log
 ```
 
-### 5. Run API / UI
+### What the logs show
+
+```
+SEMANTIC SEARCH
+  Raw query     : 'I am your father'
+  Cleaned query : 'i am your father'
+  #01 chunk_id=12345-2 | cosine_distance=0.412000 | cosine_similarity=0.588000 | ...
+```
+
+- **cosine_distance** — from ChromaDB (lower = closer)  
+- **cosine_similarity** — we use `1 - distance` in the UI (higher = closer)  
+- **Dedupe** — only one result per subtitle file (best chunk wins)
+
+---
+
+## Important: re-ingest after retrieval fixes
+
+If search felt completely wrong before, **delete the old index and rebuild**:
+
+```bash
+rm -rf chroma_db artifacts
+python -m src.ingest --mode both --reset --sample 0.1
+```
+
+Fixes applied: **per-cue chunking** (not whole-movie blobs), **smaller chunks** (150 tokens), **phrase reranking**, **keyword stop-word fix**.
+
+Verify a line:
+
+```bash
+python scripts/verify_line.py --query "your exact dialogue line" --debug
+```
+
+## Optional REST API (`app/main.py`)
+
+Removed earlier to keep the repo minimal; **restored** as an optional API (same logic as Streamlit):
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-```bash
-streamlit run streamlit_app.py
-```
+Docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-**Live audio search:** open Streamlit → **Audio search** → use **Record live audio** (~2 min clip) → **Search audio**.
+---
 
-## Core algorithm
+## Why retrieval accuracy may be lower than expected
 
-1. **Preprocess** — decode ZIP subtitles, remove SRT timestamps and OpenSubtitles boilerplate.
-2. **Chunk** — split long subtitles into 500-token windows with 50-token overlap.
-3. **Vectorize**
-  - Keyword: TF-IDF sparse vectors
-  - Semantic: SentenceTransformer dense embeddings (L2-normalized)
-4. **Store** — ChromaDB (`cosine` space) for semantic chunks; joblib/npz for TF-IDF.
-5. **Query** — embed (or TF-IDF transform) the query; rank by **cosine similarity**.
-6. **Audio** — Whisper transcript → same pipeline as text.
-
-## Configuration
-
-Edit `config.py` or `.env` (from `.env.example`):
+Understanding these limits helps you interpret scores and improve results.
 
 
-| Setting                | Default                      |
-| ---------------------- | ---------------------------- |
-| `SAMPLE_FRACTION`      | `1.0` (use `0.3` on low RAM) |
-| `CHUNK_SIZE_TOKENS`    | `500`                        |
-| `CHUNK_OVERLAP_TOKENS` | `50`                         |
-| `EMBEDDING_MODEL`      | `paraphrase-MiniLM-L6-v2`    |
-| `WHISPER_MODEL`        | `base`                       |
+| Reason                    | Explanation                                                                                                              |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **Partial index**         | If you used `--sample 0.05`, only ~5% of movies are searchable. The right film may not be in the index at all.           |
+| **Old chunking (fixed)**  | Whole movies were one blob per chunk — bad for single lines. **Re-ingest** with cue-based ~150-token chunks.             |
+| **Partial index**         | If only part of the DB was ingested, your movie may not be in the index at all.                                          |
+| **Cleaning**              | Timestamps and ads are stripped; **lowercasing** can slightly change matching. Very short queries are ambiguous.         |
+| **Small embedding model** | `paraphrase-MiniLM-L3-v2` is fast but less accurate than larger models (e.g. `all-MiniLM-L6-v2` or `all-mpnet-base-v2`). |
+| **Approximate search**    | Chroma uses **HNSW** — fast but not exact nearest-neighbor; rank 1–3 can occasionally be wrong.                          |
+| **Audio path**            | Whisper may mis-hear words → wrong query embedding → wrong matches.                                                      |
+| **Language**              | Database is mostly **English** subtitles. Other languages match poorly.                                                  |
+| **Semantic vs literal**   | Semantic search finds **similar meaning**, not always the exact film you want. Use **keyword** mode for exact phrases.   |
+| **Dedupe by file**        | We return one hit per subtitle **file**; the best chunk might not be the scene you imagined.                             |
 
 
-## API examples
+### How to improve accuracy
 
-```bash
-curl -X POST http://localhost:8000/search/text \
-  -H "Content-Type: application/json" \
-  -d '{"query": "may the force be with you", "mode": "semantic", "top_k": 5}'
-```
+1. Ingest more data: `--sample 0.2` or full `--sample 1.0`
+2. Use a stronger model in `config.py`: `EMBEDDING_MODEL = "all-MiniLM-L6-v2"` then re-ingest
+3. Search with **longer, distinctive** phrases (not single common words)
+4. For audio: clear recording, English dialogue, enable DEBUG and check the **transcript**
+5. Compare modes: semantic vs keyword
+6. Read `logs/retrieval.log` — if top `cosine_similarity` is below ~0.4, matches are weak
+
+---
+
+## Ingest options
 
 ```bash
-curl -X POST http://localhost:8000/search/audio \
-  -F "file=@queries/audio/clip.wav" \
-  -F "mode=semantic"
+python -m src.ingest --help
+
+# Examples
+python -m src.ingest --mode semantic --sample 0.1 --reset
+python -m src.ingest --mode both --sample 0.1 --reset
+python -m src.ingest --mode both --reset                    # full — hours, high RAM
+python -m src.ingest --mode semantic --debug                # verbose ingest logs
 ```
 
-## Resume / portfolio bullets
 
-- Built a **semantic retrieval pipeline** over 80k+ subtitle documents with **chunking**, **ChromaDB**, and **cosine similarity**.
-- Implemented **dual search**: sparse **TF-IDF** (keyword) vs dense **SentenceTransformer** (semantic).
-- Added **Shazam-style audio search** using **Whisper** → embedding → top-k subtitle match with OpenSubtitles deep links.
+| Flag              | Meaning                                    |
+| ----------------- | ------------------------------------------ |
+| `--sample 0.05`   | Use 5% of database                         |
+| `--reset`         | Delete `chroma_db/` and `artifacts/` first |
+| `--batch-size 50` | Subtitles per DB batch                     |
+| `--embed-batch 8` | Embedding mini-batch size                  |
+| `--debug`         | DEBUG logging                              |
+
+
+---
+
+## Course data hint notebook
+
+The file `project_hint_reading_the_data.ipynb` (from your course folder) shows Steps 1–6:
+
+1. Table `zipfiles`
+2. Columns `num`, `name`, `content`
+3. Load into pandas
+4. `content` is ZIP binary
+5. Decode with `zipfile` + `latin-1`
+6. `decode_method` on all rows
+
+Our `src/database.py` → `decompress_subtitle()` implements the same logic, in batches for large files.
+
+---
+
+## Troubleshooting
+
+
+| Issue                                         | Fix                                                                |
+| --------------------------------------------- | ------------------------------------------------------------------ |
+| `Collection [subtitle_chunks] does not exist` | Run ingest first                                                   |
+| `bus error` on Mac                            | Smaller `--sample`, `--embed-batch 4`, CPU-only ingest (see above) |
+| Empty / weak results                          | Increase `--sample`; check DEBUG logs for similarity scores        |
+| No live mic in UI                             | `pip install 'streamlit>=1.46'`                                    |
+| Whisper fails                                 | Install `ffmpeg`                                                   |
+
+
+---
 
 ## License & data
 
-Subtitle data is from [OpenSubtitles.org](https://www.opensubtitles.org). Use in accordance with their terms and your course guidelines.
+Subtitle data from [OpenSubtitles.org](https://www.opensubtitles.org). Use per their terms and your course guidelines.

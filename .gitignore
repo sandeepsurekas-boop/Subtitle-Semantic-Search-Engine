@@ -18,6 +18,7 @@ data/*.db
 data/*.sqlite
 chroma_db/
 artifacts/
+logs/
 *.pkl
 *.joblib
 queries/audio/*

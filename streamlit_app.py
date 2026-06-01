@@ -6,7 +6,10 @@ from __future__ import annotations
 import streamlit as st
 
 import config
+from src.logging_config import setup_logging
 from src.audio_query import save_audio_bytes, transcribe_audio
+
+setup_logging(config.LOG_LEVEL)
 from src.chroma_store import get_index_status
 from src.retrieve import IndexNotReadyError, SubtitleSearchEngine
 

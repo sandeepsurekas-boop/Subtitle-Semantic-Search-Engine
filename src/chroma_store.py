@@ -149,11 +149,13 @@ def get_index_status(
         "keyword_index": (artifacts_dir / "tfidf_vectorizer.joblib").exists(),
     }
     if chroma_path.exists():
-        client = get_client(chroma_path)
         try:
+            client = get_client(chroma_path)
             coll = client.get_collection(config.COLLECTION_SEMANTIC)
             status["semantic_chunks"] = coll.count()
             status["semantic_index"] = status["semantic_chunks"] > 0
+            fn = client.get_collection(config.COLLECTION_FILENAMES)
+            status["indexed_subtitles"] = fn.count()
         except Exception:
             pass
     return status

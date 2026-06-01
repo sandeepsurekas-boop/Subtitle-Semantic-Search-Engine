@@ -1,4 +1,5 @@
 """Project configuration — paths and hyperparameters."""
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -22,9 +23,14 @@ COLLECTION_FILENAMES = "subtitle_filenames"
 # Embedding model (semantic search) — L3 is lighter on Mac RAM
 EMBEDDING_MODEL = "paraphrase-MiniLM-L3-v2"
 
-# Chunking (token windows with overlap — assignment requirement)
-CHUNK_SIZE_TOKENS = 500
-CHUNK_OVERLAP_TOKENS = 50
+# Chunking — smaller chunks + per-cue packing = better line-level retrieval
+CHUNK_SIZE_TOKENS = 150
+CHUNK_OVERLAP_TOKENS = 30
+CHUNK_BY_CUES = True
+
+# Rerank: boost when query words appear verbatim in chunk
+PHRASE_EXACT_BOOST = 0.40
+PHRASE_WORD_BOOST = 0.15
 
 # Ingest sampling (use 0.3 for limited compute)
 SAMPLE_FRACTION = 1.0
@@ -36,3 +42,8 @@ DEFAULT_TOP_K = 10
 # Audio
 AUDIO_QUERY_DIR = ROOT / "queries" / "audio"
 WHISPER_MODEL = "base"
+
+# Logging (set LOG_LEVEL=DEBUG to trace retrieval / cosine scores)
+LOG_DIR = ROOT / "logs"
+LOG_FILE = LOG_DIR / "retrieval.log"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
