@@ -47,7 +47,7 @@ Users often remember **a line of dialogue**, not the movie title. Classic search
 subtitle-semantic-search/
 ├── data/
 │   ├── README.txt                      # Database schema
-│   └── eng_subtitles_database.db       # YOU provide (~1.8 GB)
+│   └── eng_subtitles_database.db       # YOU provide
 ├── src/
 │   ├── database.py                     # Read & decode ZIP subtitles
 │   ├── cleaning.py                     # Remove timestamps, ads
