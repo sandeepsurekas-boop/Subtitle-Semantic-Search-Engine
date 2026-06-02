@@ -3,17 +3,26 @@ Movie Subtitle Search — simple UI for text and voice search.
 """
 from __future__ import annotations
 
+import hashlib
+
 import streamlit as st
+
+import importlib
 
 import config
 from src.logging_config import setup_logging
 from src.audio_query import save_audio_bytes, transcribe_audio
 
 setup_logging(config.LOG_LEVEL)
+
+# Always use latest retrieve module (avoids stale SearchResult class in long-lived Streamlit)
+import src.retrieve as _retrieve_mod
+
+importlib.reload(_retrieve_mod)
 from src.chroma_store import get_index_status
 from src.retrieve import IndexNotReadyError, SubtitleSearchEngine
+from src.titles import display_movie_name
 
-# ── Page setup ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Find Movie Lines",
     page_icon="🎬",
@@ -36,14 +45,6 @@ st.markdown(
             padding: 1.1rem 1.25rem;
             margin-bottom: 0.85rem;
         }
-        .step-label {
-            font-size: 0.72rem;
-            font-weight: 700;
-            letter-spacing: 0.06em;
-            text-transform: uppercase;
-            color: #2563eb;
-            margin-bottom: 0.35rem;
-        }
         .step-title { font-size: 1.05rem; font-weight: 600; color: #0f172a; margin-bottom: 0.25rem; }
         .step-hint { font-size: 0.9rem; color: #64748b; margin: 0; line-height: 1.45; }
         .result-card {
@@ -63,6 +64,8 @@ st.markdown(
             border-radius: 999px;
             margin-bottom: 0.35rem;
         }
+        .result-card a { color: #1d4ed8; text-decoration: none; font-weight: 600; }
+        .result-card a:hover { text-decoration: underline; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -72,23 +75,26 @@ st.markdown(
     """
     <div class="hero">
         <h1>🎬 Find Movie & TV Lines</h1>
-        <p>Type a quote you remember, or hum / play a clip from a show —
-        we’ll match it to subtitles from thousands of films.</p>
+        <p>Type a quote you remember, or play a clip from a show —
+        we’ll find which film or series it came from.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# ── Session state (voice flow) ───────────────────────────────────────────────
-for key, default in (
-    ("audio_bytes", None),
-    ("audio_suffix", ".wav"),
-    ("audio_format", "audio/wav"),
-    ("transcript", None),
-    ("record_key", 0),
-):
-    if key not in st.session_state:
-        st.session_state[key] = default
+# Session state
+_defaults = {
+    "audio_bytes": None,
+    "audio_suffix": ".wav",
+    "audio_format": "audio/wav",
+    "transcript": None,
+    "record_key": 0,
+    "audio_hash": None,
+    "search_mode": "semantic",
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 _FORMAT = {
     ".wav": "audio/wav",
@@ -102,7 +108,12 @@ _FORMAT = {
 def _start_over() -> None:
     st.session_state.audio_bytes = None
     st.session_state.transcript = None
+    st.session_state.audio_hash = None
     st.session_state.record_key += 1
+
+
+def _audio_fingerprint(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
 
 
 def _store_audio(live, uploaded) -> None:
@@ -118,12 +129,12 @@ def _store_audio(live, uploaded) -> None:
         st.session_state.audio_suffix = suffix
         st.session_state.audio_format = _FORMAT.get(suffix, "audio/wav")
         st.session_state.transcript = None
+        st.session_state.audio_hash = None
 
 
-def _step(label: str, title: str, hint: str) -> None:
+def _hint_step(title: str, hint: str) -> None:
     st.markdown(
-        f'<div class="step"><div class="step-label">{label}</div>'
-        f'<div class="step-title">{title}</div>'
+        f'<div class="step"><div class="step-title">{title}</div>'
         f'<p class="step-hint">{hint}</p></div>',
         unsafe_allow_html=True,
     )
@@ -131,24 +142,73 @@ def _step(label: str, title: str, hint: str) -> None:
 
 def _show_results(results) -> None:
     if not results:
-        st.info("No close matches. Try different words or the other search style above.")
+        st.info("No close matches. Try a movie name, a quote, or the other search style.")
         return
     st.markdown("### 🎯 Best matches")
     for i, r in enumerate(results, 1):
         pct = max(0, min(100, int(r.score * 100)))
-        title = r.filename.replace(".", " ").replace("_", " ") if r.filename else f"Subtitle #{r.subtitle_id}"
+        movie = display_movie_name(r.filename, r.subtitle_id)
+        match_kind = getattr(r, "match_type", "dialogue")
+        badge = "Name match" if match_kind == "title" else f"{pct}% match"
         st.markdown(
             f'<div class="result-card">'
-            f'<span class="match-badge">{pct}% match</span><br>'
-            f'<strong>{i}. {title}</strong></div>',
+            f'<span class="match-badge">{badge}</span><br>'
+            f'<strong>{i}. <a href="{r.opensubtitles_url}" target="_blank" '
+            f'rel="noopener">{movie}</a></strong></div>',
             unsafe_allow_html=True,
         )
-        st.caption(f"“{r.snippet[:280]}…”" if len(r.snippet) > 280 else f"“{r.snippet}”")
-        st.link_button("Open on OpenSubtitles ↗", r.opensubtitles_url, use_container_width=True)
+        if match_kind != "title" and r.snippet:
+            st.caption(f"“{r.snippet[:280]}…”" if len(r.snippet) > 280 else f"“{r.snippet}”")
 
 
-# ── Ready check ─────────────────────────────────────────────────────────────
+def _run_search(query: str, mode: str, engine: SubtitleSearchEngine):
+    if hasattr(engine, "search_combined"):
+        return engine.search_combined(query, mode=mode, top_k=config.DEFAULT_TOP_K)
+    # Fallback if an old cached engine is still in memory
+    title = getattr(engine, "search_by_title", lambda q, top_k=10: [])(query, config.DEFAULT_TOP_K)
+    if mode == "keyword":
+        dialogue = engine.search_keyword(query, config.DEFAULT_TOP_K)
+    else:
+        dialogue = engine.search_semantic(query, config.DEFAULT_TOP_K)
+    seen = {h.subtitle_id for h in title}
+    merged = list(title)
+    for h in dialogue:
+        if h.subtitle_id not in seen:
+            merged.append(h)
+        if len(merged) >= config.DEFAULT_TOP_K:
+            break
+    return merged[: config.DEFAULT_TOP_K]
+
+
+def _auto_transcribe() -> None:
+    """Transcribe as soon as audio is available — no extra button."""
+    data = st.session_state.audio_bytes
+    if not data:
+        return
+    fp = _audio_fingerprint(data)
+    if st.session_state.audio_hash == fp and st.session_state.transcript is not None:
+        return
+    if st.session_state.audio_hash == fp:
+        return  # already tried and failed
+
+    path = save_audio_bytes(data, suffix=st.session_state.audio_suffix)
+    try:
+        with st.spinner("Listening and writing what we heard…"):
+            st.session_state.transcript = transcribe_audio(
+                path, model_size=config.WHISPER_MODEL
+            )
+        st.session_state.audio_hash = fp
+    except RuntimeError as err:
+        st.error(str(err))
+        st.session_state.audio_hash = fp
+    except ValueError as err:
+        st.warning(str(err))
+        st.session_state.audio_hash = fp
+
+
+# ── Setup checks ─────────────────────────────────────────────────────────────
 status = get_index_status()
+film_count = status.get("indexed_subtitles", 0)
 
 if not status["database"]:
     st.error("**Setup needed:** the subtitle database file is missing.")
@@ -157,81 +217,96 @@ if not status["database"]:
     st.stop()
 
 if not status["semantic_index"]:
-    st.warning("**Almost ready** — the app still needs to index subtitles once (this can take a while).")
+    st.warning("**Almost ready** — subtitles still need to be indexed once.")
     with st.expander("How to fix (for your tech person)"):
         st.code("python -m src.ingest --mode semantic --sample 0.05 --reset", language="bash")
     st.stop()
 
-# ── How to search (one simple choice) ─────────────────────────────────────────
+# ── Search style (tooltips on hover only) ────────────────────────────────────
 st.markdown("**How should we search?**")
-_opts = ["By meaning", "By exact words"]
-if hasattr(st, "segmented_control"):
-    search_style = st.segmented_control(
-        "search_style",
-        options=_opts,
-        default="By meaning",
-        label_visibility="collapsed",
-    )
-else:
-    search_style = st.radio(
-        "search_style",
-        options=_opts,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-st.caption("**By meaning** — similar ideas · **By exact words** — same words in the subtitle")
-mode = "semantic" if search_style == "By meaning" else "keyword"
+c_meaning, c_exact = st.columns(2)
 
-if mode == "keyword" and not status["keyword_index"]:
-    st.warning("Exact-word search isn’t set up yet. Use **By meaning** for now.")
+with c_meaning:
+    if st.button(
+        "By meaning",
+        use_container_width=True,
+        type="primary" if st.session_state.search_mode == "semantic" else "secondary",
+        help="Similar ideas — finds lines that mean something similar, even with different words.",
+        key="btn_meaning",
+    ):
+        st.session_state.search_mode = "semantic"
+        st.rerun()
+
+with c_exact:
+    keyword_ok = status.get("keyword_index", False)
+    if st.button(
+        "By exact words",
+        use_container_width=True,
+        type="primary" if st.session_state.search_mode == "keyword" else "secondary",
+        help="Same words in the subtitle — best when you know the exact phrase.",
+        key="btn_exact",
+        disabled=not keyword_ok,
+    ):
+        st.session_state.search_mode = "keyword"
+        st.rerun()
+
+mode = st.session_state.search_mode
+if mode == "keyword" and not status.get("keyword_index"):
+    st.session_state.search_mode = "semantic"
     mode = "semantic"
 
 
-@st.cache_resource
-def _engine(m: str):
+# Do not cache the engine object — Streamlit cache can keep an old class instance
+# missing methods after code updates (e.g. search_combined).
+def _get_engine(m: str) -> SubtitleSearchEngine:
     return SubtitleSearchEngine.create_if_ready(mode=m)
 
 
 try:
-    engine = _engine(mode)
+    engine = _get_engine(mode)
 except IndexNotReadyError:
     st.error("Search isn’t ready yet. Ask whoever installed the app to run the index step.")
     st.stop()
 
-# ── Two ways to search ────────────────────────────────────────────────────────
+# ── Tabs ─────────────────────────────────────────────────────────────────────
 tab_words, tab_voice = st.tabs(["✏️ Type a quote", "🎤 Use your voice"])
 
 with tab_words:
-    _step("Option A", "Remember the line?", "Type what you heard — even part of a sentence works.")
-    quote = st.text_input(
-        "quote",
-        placeholder='e.g. "I\'ll be back" or "winter is coming"',
-        label_visibility="collapsed",
+    _hint_step(
+        "Search by quote or movie name",
+        "Type a line you remember, or a film/show name like Avatar or Broker.",
     )
-    if st.button("Find subtitles", type="primary", use_container_width=True, key="go_text"):
+    with st.form("text_search_form", clear_on_submit=False):
+        quote = st.text_input(
+            "quote",
+            placeholder='e.g. "Avatar", "I\'ll be back", or "winter is coming"',
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button(
+            "Find film or show",
+            type="primary",
+            use_container_width=True,
+        )
+    if submitted:
         if not quote.strip():
-            st.warning("Please type a line first.")
+            st.warning("Please type a movie name or a line first.")
         else:
-            with st.spinner("Looking through subtitles…"):
-                hits = (
-                    engine.search_keyword(quote, config.DEFAULT_TOP_K)
-                    if mode == "keyword"
-                    else engine.search_semantic(quote, config.DEFAULT_TOP_K)
-                )
-            _show_results(hits)
+            with st.spinner("Looking through films and shows…"):
+                _show_results(_run_search(quote.strip(), mode, engine))
 
 with tab_voice:
-    _step(
-        "Option B",
+    _hint_step(
         "Heard it on TV?",
-        "Record up to ~2 minutes from a movie or show, listen back, turn it into words, then search.",
+        "Record or upload a short clip. We’ll write what we hear, then search — "
+        "using the same style you picked above.",
     )
 
     mic = None
     if hasattr(st, "audio_input"):
         mic = st.audio_input("Tap to record", key=f"mic_{st.session_state.record_key}")
     else:
-        st.info("To record from your mic, update Streamlit: `pip install 'streamlit>=1.46'`")
+        st.info("To record from your mic: `pip install 'streamlit>=1.46'`")
+
     upload = st.file_uploader(
         "Or choose an audio file",
         type=["wav", "mp3", "m4a", "ogg", "webm"],
@@ -239,72 +314,58 @@ with tab_voice:
     )
     _store_audio(mic, upload)
 
-    # Step 1 — has audio?
     if not st.session_state.audio_bytes:
-        st.caption("👆 Record or upload first. Tip: hold the mic near the speaker for a clear clip.")
+        st.caption("👆 Record or upload a clip first (up to ~2 minutes works best).")
     else:
-        # Step 2 — listen
-        st.markdown(
-            '<div class="step"><div class="step-label">Step 1</div>'
-            '<div class="step-title">Listen to your clip</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown("**Your recording**")
         st.audio(st.session_state.audio_bytes, format=st.session_state.audio_format)
 
-        # Step 3 — convert (one button until transcript exists)
-        if st.session_state.transcript is None:
-            if st.button("Turn speech into words", type="primary", use_container_width=True):
-                path = save_audio_bytes(
-                    st.session_state.audio_bytes,
-                    suffix=st.session_state.audio_suffix,
-                )
-                try:
-                    with st.spinner("Converting speech to text…"):
-                        st.session_state.transcript = transcribe_audio(
-                            path, model_size=config.WHISPER_MODEL
-                        )
-                    st.rerun()
-                except RuntimeError as err:
-                    st.error(str(err))
-                except ValueError as err:
-                    st.warning(str(err))
-        else:
-            st.markdown(
-                '<div class="step"><div class="step-label">Step 2</div>'
-                '<div class="step-title">Check the words</div>'
-                '<p class="step-hint">Fix anything the computer got wrong, then find matching subtitles.</p></div>',
-                unsafe_allow_html=True,
-            )
-            st.session_state.transcript = st.text_area(
-                "transcript_edit",
-                value=st.session_state.transcript,
-                height=100,
-                label_visibility="collapsed",
-                placeholder="Your words will appear here…",
-            )
+        _auto_transcribe()
 
-            find_col, redo_col = st.columns([2, 1])
-            with find_col:
-                find_clicked = st.button(
-                    "Find matching subtitles",
-                    type="primary",
-                    use_container_width=True,
-                )
-            with redo_col:
-                if st.button("Start over", use_container_width=True):
-                    _start_over()
-                    st.rerun()
+        if st.session_state.transcript is not None:
+            st.markdown("**What we heard** — edit if needed, then press Enter or tap Find:")
 
-            if find_clicked:
+            submitted_audio = False
+            redo_clicked = False
+            with st.form("audio_search_form", clear_on_submit=False):
+                st.session_state.transcript = st.text_area(
+                    "transcript_edit",
+                    value=st.session_state.transcript,
+                    height=100,
+                    label_visibility="collapsed",
+                )
+                find_col, redo_col = st.columns([2, 1])
+                with find_col:
+                    submitted_audio = st.form_submit_button(
+                        "Find film or show",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with redo_col:
+                    redo_clicked = st.form_submit_button(
+                        "Start over",
+                        use_container_width=True,
+                    )
+
+            if redo_clicked:
+                _start_over()
+                st.rerun()
+            elif submitted_audio:
                 text = (st.session_state.transcript or "").strip()
                 if not text:
-                    st.warning("Nothing to search — try **Start over** and record again.")
+                    st.warning("We couldn’t hear any words — try **Start over**.")
                 else:
-                    with st.spinner("Finding the best subtitle matches…"):
-                        hits = engine.search_semantic(text, config.DEFAULT_TOP_K)
-                    _show_results(hits)
+                    with st.spinner("Looking through films and shows…"):
+                        _show_results(_run_search(text, mode, engine))
+        elif st.session_state.audio_hash:
+            st.caption("Couldn’t make out speech. Try a clearer clip or **Start over**.")
+        else:
+            st.caption("Writing what we heard from your clip…")
 
-st.caption(
-    f"Searching {status['semantic_chunks']:,} subtitle pieces · "
-    "Links open OpenSubtitles.org"
-)
+# Footer: films/shows count
+if film_count > 0:
+    st.caption(
+        f"Searching across **{film_count:,}** films & shows · Links open OpenSubtitles.org"
+    )
+else:
+    st.caption("Links open OpenSubtitles.org")

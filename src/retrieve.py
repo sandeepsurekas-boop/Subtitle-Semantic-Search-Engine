@@ -21,6 +21,7 @@ from src.cleaning import clean_query
 from src.embeddings import encode_query
 from src.keyword_search import KeywordSearchEngine
 from src.logging_config import get_logger, setup_logging
+from src.titles import display_movie_name, filename_matches_query
 
 logger = get_logger("retrieve")
 
@@ -42,6 +43,7 @@ class SearchResult:
     opensubtitles_url: str
     chunk_id: str = ""
     cosine_distance: float | None = None
+    match_type: str = "dialogue"  # "title" when matched by film/show name
 
 
 def _phrase_boost(query: str, chunk_text: str) -> float:
@@ -80,6 +82,7 @@ def _rerank_and_dedupe(
                 opensubtitles_url=h.opensubtitles_url,
                 chunk_id=h.chunk_id,
                 cosine_distance=h.cosine_distance,
+                match_type=getattr(h, "match_type", "dialogue"),
             )
         )
     boosted.sort(key=lambda x: x.score, reverse=True)
@@ -176,7 +179,7 @@ class SubtitleSearchEngine:
     @classmethod
     def create_if_ready(cls, mode: str = "semantic", **kwargs) -> "SubtitleSearchEngine":
         return cls(
-            require_semantic=mode == "semantic",
+            require_semantic=False,
             require_keyword=mode == "keyword",
             **kwargs,
         )
@@ -259,6 +262,83 @@ class SubtitleSearchEngine:
         logger.info("Returning %d keyword results after rerank", len(final))
         return final
 
+    def _snippet_for_subtitle(self, subtitle_id: str) -> str:
+        if self.chunks is None:
+            return ""
+        try:
+            got = self.chunks.get(
+                where={"subtitle_id": subtitle_id},
+                include=["documents"],
+                limit=1,
+            )
+            docs = got.get("documents") or []
+            if docs and docs[0]:
+                d = docs[0]
+                return (d[0] if isinstance(d, list) else d)[:300]
+        except Exception:
+            pass
+        return ""
+
+    def search_by_title(self, query: str, top_k: int = 10) -> list[SearchResult]:
+        """Match film/show name against indexed subtitle filenames."""
+        q = query.strip()
+        if len(q) < 2:
+            return []
+
+        logger.info("TITLE SEARCH for %r", q)
+        candidates: list[tuple[float, str, str]] = []
+
+        if self.filenames:
+            data = self.filenames.get(include=["documents"])
+            for sid, doc in zip(data.get("ids") or [], data.get("documents") or []):
+                fname = doc if isinstance(doc, str) else (doc[0] if doc else "")
+                ok, score = filename_matches_query(fname, q)
+                if ok:
+                    candidates.append((score, sid, fname))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        hits: list[SearchResult] = []
+        for score, sid, fname in candidates[:top_k]:
+            snippet = self._snippet_for_subtitle(sid) or "Matched by film or show name."
+            hits.append(
+                SearchResult(
+                    subtitle_id=sid,
+                    filename=fname,
+                    score=score,
+                    snippet=snippet,
+                    opensubtitles_url=f"https://www.opensubtitles.org/en/subtitles/{sid}",
+                    match_type="title",
+                )
+            )
+            logger.info(
+                "  TITLE HIT %s | %s | score=%.2f",
+                sid,
+                display_movie_name(fname, sid),
+                score,
+            )
+        return hits
+
+    def search_combined(self, query: str, mode: str = "semantic", top_k: int = 10) -> list[SearchResult]:
+        """Movie name + dialogue search (title matches listed first)."""
+        title_hits = self.search_by_title(query, top_k)
+        if mode == "keyword" and self.keyword:
+            dialogue_hits = self.search_keyword(query, top_k)
+        elif self.chunks is not None:
+            dialogue_hits = self.search_semantic(query, top_k)
+        else:
+            dialogue_hits = []
+
+        seen = {h.subtitle_id for h in title_hits}
+        merged = list(title_hits)
+        for h in dialogue_hits:
+            if h.subtitle_id in seen:
+                continue
+            seen.add(h.subtitle_id)
+            merged.append(h)
+            if len(merged) >= top_k:
+                break
+        return merged[:top_k]
+
     def search_audio(
         self,
         audio_path: Path,
@@ -269,9 +349,7 @@ class SubtitleSearchEngine:
         logger.info("Audio search: file=%s mode=%s", audio_path, mode)
         transcript = transcribe_audio(audio_path, model_size=whisper_model)
         logger.info("Whisper transcript (%d chars): %r", len(transcript), transcript[:200])
-        if mode == "keyword":
-            return transcript, self.search_keyword(transcript, top_k)
-        return transcript, self.search_semantic(transcript, top_k)
+        return transcript, self.search_combined(transcript, mode=mode, top_k=top_k)
 
 
 def _print_results(results: list[SearchResult], transcript: str | None = None) -> None:
@@ -306,10 +384,7 @@ def main() -> None:
         transcript, results = engine.search_audio(args.audio, mode=args.mode, top_k=args.top_k)
         _print_results(results, transcript)
     elif args.query:
-        if args.mode == "keyword":
-            results = engine.search_keyword(args.query, args.top_k)
-        else:
-            results = engine.search_semantic(args.query, args.top_k)
+        results = engine.search_combined(args.query, mode=args.mode, top_k=args.top_k)
         _print_results(results)
     else:
         parser.error("Provide --query or --audio")

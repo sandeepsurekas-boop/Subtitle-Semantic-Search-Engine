@@ -50,10 +50,7 @@ def health():
 def search_text(body: TextSearchRequest):
     try:
         engine = get_engine(body.mode)
-        if body.mode == "keyword":
-            hits = engine.search_keyword(body.query, body.top_k)
-        else:
-            hits = engine.search_semantic(body.query, body.top_k)
+        hits = engine.search_combined(body.query, mode=body.mode, top_k=body.top_k)
     except IndexNotReadyError as e:
         raise HTTPException(503, str(e)) from e
     return [_hit(h) for h in hits]
